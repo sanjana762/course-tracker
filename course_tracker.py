@@ -929,7 +929,7 @@ def build_summary_html(t, total, launches, added, removed, failed, recent_total,
 <table width="100%" cellpadding="0" cellspacing="0" style="background:#eef0f6;padding:24px 0;"><tr><td align="center">
 <table width="680" cellpadding="0" cellspacing="0" style="max-width:680px;width:100%;background:#ffffff;border-radius:14px;overflow:hidden;">
 <tr><td style="background:#1f35c9;background-image:linear-gradient(135deg,#1a2266,#2b4eea);padding:30px 32px;">
-  <div style="font:700 26px Arial,sans-serif;color:#ffffff;">Competitor Course Tracker - Weekly Report</div>
+  <div style="font:700 26px Arial,sans-serif;color:#ffffff;">Competitors New Launches Tracker - Weekly Report</div>
   <div style="font:14px Arial,sans-serif;color:#c7d0ff;margin-top:8px;">{e(t)} &nbsp;&middot;&nbsp; {len(SITES)} sites &nbsp;&middot;&nbsp; <a href="{e(sheet_url)}" style="color:#c7d0ff;">Open spreadsheet &#8599;</a></div>
 </td></tr>
 <tr><td><table width="100%" cellpadding="0" cellspacing="0" style="border-bottom:1px solid #e8eaf0;"><tr>
@@ -940,7 +940,7 @@ def build_summary_html(t, total, launches, added, removed, failed, recent_total,
 </tr></table></td></tr>
 <tr><td>{"".join(body)}</td></tr>
 <tr><td style="background:#f7f8fc;padding:18px 32px;margin-top:24px;font:12px Arial,sans-serif;color:#9aa1b8;text-align:center;">
-  Sent automatically by the Competitor Course Tracker. {recent_total} courses are currently on the "Recent Launches" tab. View the spreadsheet for details on all tabs.</td></tr>
+  Sent automatically by the Competitors New Launches Tracker. {recent_total} courses are currently on the "Recent Launches" tab. View the spreadsheet for details on all tabs.</td></tr>
 </table></td></tr></table></body></html>"""
 
 
@@ -962,10 +962,10 @@ def send_summary_email(t, master, recent, changes, summary):
         total = sum(r.get("Course Status") == "Active" for r in master)
         sheet_url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}"
         html_body = build_summary_html(t, total, sorted(launches), sorted(added), sorted(removed), failed, len(recent), sheet_url)
-        text_body = (f"Competitor Course Tracker - {t}\nCourses tracked: {total} | New launches: {len(launches)} | Added: {len(added)} | Removed: {len(removed)}\n"
+        text_body = (f"Competitors New Launches  - {t}\nCourses tracked: {total} | New launches: {len(launches)} | Added: {len(added)} | Removed: {len(removed)}\n"
                      + ("Failed sites: " + ", ".join(failed) + "\n" if failed else "") + f"Spreadsheet: {sheet_url}\n")
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"Course Tracker {t}: {len(launches)} new launch(es), {len(added)} added, {len(removed)} removed"
+        msg["Subject"] = f"New Launches {t}: {len(launches)} new launch(es), {len(added)} added, {len(removed)} removed"
         msg["From"], msg["To"] = user, ", ".join(to)
         msg.attach(MIMEText(text_body, "plain", "utf-8"))
         msg.attach(MIMEText(html_body, "html", "utf-8"))
