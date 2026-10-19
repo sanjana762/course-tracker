@@ -1,3 +1,22 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Competitor Course Tracker v6 + Email Summary (GitHub version).
+
+Scrapes 16 competitor edtech sites, detects new courses / batches, updates a Google Sheet
+(Master, Recent Launches, Change Log tabs) and emails an HTML summary.
+
+Configuration is read from environment variables (GitHub Actions secrets):
+  EMAIL_USER                  sender Gmail address
+  EMAIL_APP_PASSWORD          16-character Gmail App Password (NOT the normal password)
+  EMAIL_TO                    recipient(s), comma-separated (optional, defaults to EMAIL_USER)
+  FIRECRAWL_API_KEY           optional, for JavaScript-rendered pages
+  GOOGLE_SERVICE_ACCOUNT_JSON service-account key JSON (the sheet must be shared with that account)
+  SPREADSHEET_ID              optional override of the Google Sheet ID
+  STORE                       optional: "sheets" (default) or "local" (CSV files in tracker_data/)
+  ONLY_SITES                  optional: e.g. "Hero Vired,NIIT" to run a subset
+  RUN_DATE                    optional: YYYY-MM-DD to override today
+"""
+
 import importlib, subprocess, sys
 for _pkg, _mod in [("beautifulsoup4", "bs4"), ("requests", "requests"), ("python-dateutil", "dateutil"), ("gspread", "gspread")]:
     try:
@@ -5,7 +24,7 @@ for _pkg, _mod in [("beautifulsoup4", "bs4"), ("requests", "requests"), ("python
     except ImportError:
         subprocess.check_call([sys.executable, "-m", "pip", "-q", "install", _pkg])
 
-import re, os, csv, json, time, gzip, hashlib
+import re, os, csv, json, time, gzip, hashlib, threading
 from datetime import date, datetime
 from difflib import SequenceMatcher
 from urllib.parse import urljoin, urlparse
@@ -14,14 +33,14 @@ import requests
 from bs4 import BeautifulSoup
 from dateutil import parser as dp
 
-STORE = "sheets"                       # "sheets" | "local" (CSV files in LOCAL_DIR, for testing)
-SPREADSHEET_ID = "1pGV-qW83t08BO_FLifSeULpIx9Fn8WVp8SeOCRH9CGQ"
-SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "")   # empty / missing in Colab -> Colab login popup
+STORE = os.environ.get("STORE", "sheets")                       # "sheets" | "local" (CSV files in LOCAL_DIR, for testing)
+SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "1lYI_4cehSpkbKyL8KSncYs03YeuIw-DV3BsR9DwZvV4")
+SERVICE_ACCOUNT_FILE = ""   # empty / missing in Colab -> Colab login popup
 LOCAL_DIR = "tracker_data"
-ONLY_SITES = [s.strip() for s in os.environ.get("ONLY_SITES", "").split(",") if s.strip()]      # e.g. "Maven,Imarticus"
+ONLY_SITES = [s.strip() for s in os.environ.get("ONLY_SITES", "").split(",") if s.strip()]      # e.g. "Hero Vired,NIIT"
 RUN_DATE = os.environ.get("RUN_DATE", "")                                                       # "YYYY-MM-DD" to override today
 
-RECENT_LAUNCH_DAYS = 30          # explicit-label launch stays on "Recent Launches" this long (about 3 months)
+# "Recent Launches" tab = ONLY the launches detected in the latest run (last run's launches drop off automatically)
 POTENTIAL_WINDOW_DAYS = 28       # "first appeared, no label" stays Potential this long
 STALE_START_DAYS = 30           # a batch that started longer ago than this is never a launch
 MISSING_RUNS_BEFORE_NOT_LISTED = 2
@@ -30,6 +49,10 @@ BULK_MIN, BULK_FRAC = 6, 0.25    # more brand-new courses than max(6, 25% of old
 MAX_PAGES_PER_SITE = 150         # course pages opened per site per run (courses with signals first)
 MAX_SITEMAP_URLS = 600
 WORKERS = 4
+RENDER_START_PAGES = True        # render every site's listing/start pages (needs FIRECRAWL_API_KEY or Playwright): many badges / batch lines are drawn by JavaScript
+RENDER_PAGE_IF_NO_SIGNAL = True  # a course page whose plain HTML shows no New / batch / date wording is re-read RENDERED (JS may draw it)
+MAX_RENDERS_PER_SITE = 25        # cap on those extra page renders per site per run (protects Firecrawl free credits)
+USE_FIRECRAWL = True             # False -> use only the free local Playwright browser (slower, uses no credits)
 
 # ---------------- HARD EXCLUSIONS (your "links to remove" list) ----------------
 BLOCKED_HOST_RE = re.compile(r"(linkedin\.|facebook\.|twitter\.|instagram\.|youtube\.|youtu\.be|wa\.me|koyo)", re.I)     # not a source
@@ -81,9 +104,6 @@ SITES = {
     "Newton School": dict(start=["https://www.newtonschool.co/"], domains=["newtonschool.co"],
         include=r"(program|course|bootcamp|degree|masters|full-?stack|data|software|/ai|academy)", exclude=r"(/hire|/stories)",
         batch_labels=[r"\d+\s+seats?\s+(?:available|left|remaining)(?:\s+in\s+this\s+batch)?"]),
-    "Eruditus": dict(start=["https://eruditus.com/"], domains=["eruditus.com"],
-        include=r"(executive-education|/programs?/|/courses?/|/certificate|/degree|/mba|/masters)", exclude=r"(/insights)",
-        payment_deadline=True, batch_means_unclear=True),
     "GrowthSchool": dict(start=["https://growthschool.io/"], domains=["growthschool.io"],
         include=r"(workshop|masterclass|course|program|cohort|bootcamp|/ai|/learn)", exclude=r"(/stories)"),
     "PW Skills": dict(start=["https://pwskills.com/", "https://pwskills.com/courses/"], domains=["pwskills.com"], render=True, bare_new=True,
@@ -95,9 +115,26 @@ SITES = {
     "Imarticus": dict(start=["https://imarticus.org/"], domains=["imarticus.org"],
         include=r"(program|course|certification|/pgp|/pg-|executive|masters|bootcamp|/cfa|/cma|/acca|/frm)", exclude=r"(/placements?|/testimonials?)",
         evergreen=[r"\b(?:cfa|cma|acca|cpa|cibop|frm)\b", r"financial\s+analysis", r"banking\s*(?:and|&)\s*finance"]),
-    "Maven": dict(start=["https://maven.com/courses"], domains=["maven.com"], render=True,
-        include=r"^/[^/]+/[^/]+/?$", exclude=r"^/(login|signup|about|blog|pricing|teach|for-teams|enterprise|explore|courses|search|careers|press|privacy|terms|help|events?|learn|launch|instructors?|partners|community|apply|gift|redeem|tags?|topics?|categories|all-categories|p)(/|$)",
-        new_labels=[r"new\s+on\s+maven"], sections=dict(new=r"new\s+on\s+maven", batch=r"starting\s+soon")),
+    # ---- added: Jaro Education / Hero Vired / Times Pro / NIIT ----
+    "Jaro Education": dict(start=["https://www.jaroeducation.com/", "https://www.jaroeducation.com/online-mba/", "https://www.jaroeducation.com/executive-education/"],
+        domains=["jaroeducation.com"], sitemap="https://www.jaroeducation.com/sitemap.xml",
+        include=r"(online-mba|executive|program|programme|course|certificat|pgp|pg-|degree|masters?|mba|diploma|bootcamp|doctorate|dba)",
+        exclude=r"(/blog|/news|/media|/alumni|/placements?|/testimonials?|/study-abroad|/university-partners|/partners?)",
+        batch_means_unclear=True),                                           # no keyword given -> generic new / batch / first-appearance logic
+    "Hero Vired": dict(start=["https://herovired.com/", "https://herovired.com/courses/"], domains=["herovired.com"], render=True,
+        include=r"(program|course|certificat|degree|mba|executive|bootcamp|masters?|pgp|pg-|diploma|learning|data|ai|devops|cloud|full-?stack|finance|digital)",
+        exclude=r"(/blogs?|/news|/media|/placements?|/alumni|/testimonials?|/corporate|/for-business|/hire)",
+        new_labels=[r"^\W*coming\s+soon\b.{0,25}$"],                       # YOUR KEYWORD: a standalone "Coming Soon" badge = new launch (not "app coming soon" sentences)
+        sections=dict(new=r"coming\s+soon")),                                # courses sitting under a "Coming Soon" heading count too
+    "Times Pro": dict(start=["https://timespro.com/", "https://timespro.com/executive-education"], domains=["timespro.com"], sitemap="https://timespro.com/sitemap.xml",
+        include=r"(executive|program|course|certificat|degree|mba|masters?|pgp|epgp|early-career|post-graduate|diploma|bootcamp)",
+        exclude=r"(/blogs?|/news|/media|/alumni|/campus|/centres?|/centers?|/placements?|/testimonials?)",
+        batch_means_unclear=True),                                           # no keyword given -> generic logic; IIM/IIT programmes run many cohorts
+    "NIIT": dict(start=["https://www.niit.com/", "https://www.niit.com/india/"], domains=["niit.com"],
+        include=r"(/india/|program|course|certif|pgp|degree|masters?|bootcamp|diploma|executive)",
+        exclude=r"(/investors?|/csr|/newsroom|/campus|/centres?|/centers?|/locations?|/franchise|/alumni|/placements?|/blogs?)",
+        new_labels=[r"newly\s+launch(?:ed)?"],                               # YOUR KEYWORD: "Newly Launched" = new launch
+        sections=dict(new=r"newly\s+launch(?:ed)?")),
 }
 
 # ---------------- generic vocabulary (sites ADD to it) ----------------
@@ -111,7 +148,7 @@ NEW_SECTION_RE = re.compile(r"\b(new\s+(?:launches?|courses?|programs?|programme
 SECTION_STOP_RE = re.compile(r"(all\s+courses|explore|browse|popular|trending|categories|top\s|featured|upcoming|starting\s+soon|new\s+on|testimonials|why\s|faq)", re.I)
 
 MON = r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
-DATE_RE = rf"(?:\d{{1,2}}(?:st|nd|rd|th)?[\s\-]+{MON}\.?(?:,?\s*\d{{4}})?|{MON}\.?\s+\d{{1,2}}(?:st|nd|rd|th)?(?:,?\s*\d{{4}})?)"
+DATE_RE = rf"(?:\d{{1,2}}(?:st|nd|rd|th)?[\s\-]+{MON}\.?(?:,?\s*(?:\d{{4}}|['’]\d{{2}}\b))?|{MON}\.?\s+\d{{1,2}}(?:st|nd|rd|th)?(?:,?\s*(?:\d{{4}}|['’]\d{{2}}\b))?)"
 KEY_RE = (r"(?:apply\s+(?:by|before)|applications?\s+(?:close|closes|closing|end|ends)(?:\s+on)?|last\s+date(?:\s+to\s+apply)?|deadline|register\s+(?:by|before)"
           r"|registrations?\s+(?:close|closes|closing)(?:\s+on)?|enrol(?:l)?(?:ment)?\s+(?:closes|ends|by|before)|closes?\s+on|closing\s+on|pay\s+(?:by|before)"
           r"|admissions?\s+(?:close|closes|closing|end|ends)(?:\s+on)?)")
@@ -130,7 +167,6 @@ def log(*a):
 
 def squash(s):
     return re.sub(r"\s+", " ", (s or "").replace("\u00a0", " ")).strip()
-
 
 def http_get(url, tries=3, timeout=30):
     for i in range(tries):
@@ -155,7 +191,7 @@ def get_secret(name):
 
 def render(url):
     """JS-rendered HTML: Firecrawl (free credits) if a key is set, else a local Playwright browser, else ''."""
-    key = get_secret("FIRECRAWL_API_KEY")
+    key = get_secret("FIRECRAWL_API_KEY") if USE_FIRECRAWL else ""
     if key:
         try:
             rr = requests.post("https://api.firecrawl.dev/v1/scrape", timeout=90, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
@@ -254,7 +290,6 @@ def diagnose(site):
         for u in list(dict.fromkeys(ok))[:5]:
             log("   ok:", u)
 
-
 def collect_cards(html, page_url, cfg):
     """One item per distinct course URL: the card text around its link(s), plus any 'New on X / Starting soon' section it sits under."""
     soup = BeautifulSoup(html, "html.parser")
@@ -332,7 +367,6 @@ def sitemap_urls(sm, cfg, depth=0, found=None):
             found.append(clean_url(loc))
     return found
 
-
 def scan(strings, cfg, kind):
     """Return dict(new=[(label, kind, strong)], batch=[labels], weak=[labels]). Batch wording is masked first so 'New Batch' never counts as 'New'."""
     out = dict(new=[], batch=[], weak=[])
@@ -365,7 +399,26 @@ def scan(strings, cfg, kind):
     return out
 
 
-def read_course_page(url, cfg):
+def page_has_signal(strings, cfg):
+    """Does this page text show ANY New / batch / start-date / deadline wording?"""
+    s = strings[:150]
+    sc = scan(s, cfg, "page_top")
+    blob = " ".join(s)
+    return bool(sc["new"] or sc["batch"] or START_RE.search(blob) or DEADLINE_RE.search(blob))
+
+
+def take_render_slot(budget):
+    if budget is None:
+        return True
+    with budget["lock"]:
+        if budget["left"] <= 0:
+            return False
+        budget["left"] -= 1
+        budget["used"] += 1
+        return True
+
+
+def read_course_page(url, cfg, budget=None):
     """Open the course page. Returns alive?/reason + title + top-of-page strings. Dead = 404, redirected away, inactive, not a course."""
     res = dict(ok=False, dead=False, reason="", title="", strings=[], text="")
     time.sleep(0.15)
@@ -396,10 +449,14 @@ def read_course_page(url, cfg):
         res.update(dead=True, reason=why)
         return res
     parsed = parse_course_html(r.text)
-    if not parsed["ok"] and not parsed["junk"] and (cfg.get("render") or get_secret("FIRECRAWL_API_KEY")):
-        h2 = render(url)                                      # JS site: the plain HTML is an empty shell -> read the rendered page
+    empty_shell = not parsed["ok"] and not parsed["junk"] and (cfg.get("render") or get_secret("FIRECRAWL_API_KEY"))
+    no_signal = parsed["ok"] and RENDER_PAGE_IF_NO_SIGNAL and not page_has_signal(parsed["strings"], cfg) and take_render_slot(budget)
+    if empty_shell or no_signal:
+        h2 = render(url)                                      # JS site: empty shell OR badge / batch line missing from the plain HTML -> read the rendered page
         if h2:
-            parsed = parse_course_html(h2)
+            p2 = parse_course_html(h2)
+            if p2["ok"] or not parsed["ok"]:
+                parsed = p2
     if parsed["junk"]:
         res.update(dead=True, reason=parsed["reason"])
     elif parsed["ok"]:
@@ -438,6 +495,28 @@ def parse_course_html(html):
     out.update(ok=True, title=title[:150], strings=strings[:150], text=text[:30000])
     return out
 
+
+def diagnose_course(site, url):
+    """Run on ONE course page that shows a badge / batch date on the website but is not picked up: shows what the tracker reads from the plain page vs the rendered page."""
+    cfg = SITES[site]
+    today = date.fromisoformat(RUN_DATE) if RUN_DATE else date.today()
+    r = http_get(url)
+    plain = parse_course_html(r.text) if r is not None and r.status_code == 200 else dict(ok=False, junk=False, reason=f"HTTP {r.status_code if r is not None else 'no response'}", strings=[], title="")
+    h2 = render(url)
+    rend = parse_course_html(h2) if h2 else dict(ok=False, junk=False, reason="no rendered HTML (no FIRECRAWL_API_KEY / Playwright, or USE_FIRECRAWL=False without Playwright)", strings=[], title="")
+    for label, p in (("PLAIN HTML", plain), ("RENDERED", rend)):
+        log(f"\n=== {label}: readable={p['ok']} {p['reason']} | title: {p['title'][:80]}")
+        if p["ok"]:
+            sc = scan(p["strings"][:150], cfg, "page_top")
+            blob = " ".join(p["strings"][:150])
+            log("  new labels  :", [(a, k, s) for a, k, s in sc["new"]])
+            log("  batch labels:", sc["batch"])
+            log("  start date  :", (START_RE.search(blob).group(0) if START_RE.search(blob) else None))
+            log("  deadline    :", (DEADLINE_RE.search(blob).group(0) if DEADLINE_RE.search(blob) else None))
+            log("  first strings:", p["strings"][:25])
+    if rend["ok"]:
+        rec = build_record(site, cfg, dict(url=url, name="", duration="", strings=[], sections=[], sources={"diagnose"}), rend, today)
+        log("\n=> tracker result:", rec["Classification"], "| New Course?", rec["New Course?"], "| New Batch?", rec["New Batch?"], "| start:", rec["Course/Batch Start Date"], "|", rec["Evidence"])
 
 MASTER_COLS = ["Unique Course ID", "Website", "Course Name", "Course URL", "Course Category", "Course Type", "Duration", "New Course?", "New Batch?",
                "New Course / Batch Label", "Classification", "Confidence", "Evidence", "Application Status", "Application Deadline", "Deadline Type",
@@ -481,6 +560,7 @@ def norm_date(text, today):
     if not text:
         return "", ""
     t = re.sub(r"(?<=\d)(st|nd|rd|th)", "", text, flags=re.I).strip()
+    t = re.sub(r"['’](\d{2})\b", r" 20\1", t)                                # "13 Oct '26" -> "13 Oct 2026"
     try:
         if re.search(r"\d{4}", t):
             return dp.parse(t, dayfirst=True).date().isoformat(), ""
@@ -572,7 +652,6 @@ def build_record(site, cfg, it, page, today):
             "Course/Batch Start Date": st_iso or MISSING, "Cohort/Batch Information": cohort.strip(" |") or MISSING,
             "Current Website Label": " | ".join(labels[:6]) or "None", "Discovery Source": "+".join(sorted(it["sources"])), "Data Notes": "; ".join(notes)}
 
-
 def scrape_site(site, cfg, today):
     stats = dict(listing_rows=0, dead=0, duplicate=0, blocked_name=0, unverified_dropped=0)
     items = {}
@@ -583,7 +662,7 @@ def scrape_site(site, cfg, today):
         if r is None or r.status_code != 200:
             log(f"  plain fetch failed: {'no response' if r is None else 'HTTP ' + str(r.status_code)} (site may block bots -> a Firecrawl key helps)")
         found = collect_cards(html, url, cfg) if html else {}
-        if cfg.get("render") or len(found) < 3:
+        if RENDER_START_PAGES or cfg.get("render") or len(found) < 3:
             h2 = render(url)
             if h2:
                 found = {**found, **collect_cards(h2, url, cfg)}
@@ -601,8 +680,11 @@ def scrape_site(site, cfg, today):
     log(f"[{site}] discovered {n_cards} from pages + {len(items) - n_cards} from sitemap")
     order = sorted(items.values(), key=lambda it: (0 if (it["sections"] or scan(it["strings"], cfg, "card")["new"]) else (1 if it["strings"] else 2), it["url"]))
     todo, rest = order[:MAX_PAGES_PER_SITE], order[MAX_PAGES_PER_SITE:]
+    budget = dict(left=MAX_RENDERS_PER_SITE, used=0, lock=threading.Lock())
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        pages = list(pool.map(lambda it: read_course_page(it["url"], cfg), todo))
+        pages = list(pool.map(lambda it: read_course_page(it["url"], cfg, budget), todo))
+    if budget["used"]:
+        log(f"[{site}] re-read {budget['used']} course pages rendered (badge / batch wording was not in the plain HTML)")
     recs, dead_log = [], []
     for it, pg in zip(todo, pages):
         if pg["dead"]:
@@ -642,7 +724,6 @@ def scrape_site(site, cfg, today):
         log(f"[{site}] 0 courses. Run diagnose('{site}') to see why (blocked? JavaScript? include pattern too strict?)")
     log(f"[{site}] kept {len(out)} courses | dropped: dead={stats['dead']} duplicates={stats['duplicate']} blocked={stats['blocked_name']} unverified-sitemap={stats['unverified_dropped']}")
     return out
-
 
 def make_id(site, rec):
     return f"{re.sub(r'[^a-z0-9]+', '-', site.lower()).strip('-')}-{hashlib.sha1((url_key(rec['Course URL']) or norm_name(rec['Course Name'])).encode()).hexdigest()[:10]}"
@@ -769,23 +850,121 @@ def junk_row(p):
     """Old rows from earlier versions that violate the exclusion rules (off-site, listing, city page, banner without URL)."""
     u = (p.get("Course URL") or "").strip()
     cfg = SITES.get(p.get("Website"))
-    if not u or cfg is None:
-        return not u
+    if not u or cfg is None:                                  # no URL, or the site was removed from SITES (e.g. Eruditus / Maven) -> row is purged
+        return True
     pu = urlparse(u)
     return bool(BLOCKED_HOST_RE.search(pu.netloc)) or not host_ok(pu.netloc, cfg) or bool(NOT_COURSE_PATH_RE.search(pu.path) or CITY_PAGE_RE.search(pu.path)) or pu.path in ("", "/")
 
 
 def recent_launches(master, today):
-    """Stateless: built from Master every run. Explicit label = 90 days from detection; Potential = 28 days."""
-    out = []
-    for r in master:
-        if r.get("Course Status") != "Active" or not r.get("Launch Basis") or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", r.get("Launch Detected Date", "")):
-            continue
-        age = (today - date.fromisoformat(r["Launch Detected Date"])).days
-        if age <= (RECENT_LAUNCH_DAYS if r["Launch Basis"] == "Explicit website label" else POTENTIAL_WINDOW_DAYS):
-            out.append({**r, "Still Listed?": "Yes"})
+    """Stateless: built from Master every run. ONLY launches detected in THIS run are listed.
+    Example: 15 launches this week, 4 next week -> next week the tab holds just those 4 (the older 15 drop off; they stay in Master)."""
+    t = today.isoformat()
+    out = [{**r, "Still Listed?": "Yes"} for r in master
+           if r.get("Course Status") == "Active" and r.get("Launch Basis") and r.get("Launch Detected Date") == t]
     return sorted(out, key=lambda r: (r["Launch Detected Date"], r["Website"]), reverse=True)
 
+# =====================================================================
+# EMAIL SUMMARY
+# =====================================================================
+
+# ---------------- EMAIL SUMMARY (sent at the end of every run) ----------------
+# Secrets (GitHub Actions secrets / environment variables):
+#   EMAIL_USER          sender address (Gmail)           e.g. you@gmail.com
+#   EMAIL_APP_PASSWORD  Gmail *App Password* (16 chars, NOT your normal password)
+#   EMAIL_TO            recipient(s), comma-separated    (defaults to EMAIL_USER)
+# If EMAIL_USER / EMAIL_APP_PASSWORD are not set, the email is simply skipped.
+EMAIL_MAX_ROWS = 40      # rows shown per section in the mail (the full data is always in the sheet)
+
+
+def build_summary_html(t, total, launches, added, failed, recent_total, sheet_url):
+    from html import escape as e
+
+    def stat(num, label, color):
+        return (f'<td align="center" style="padding:18px 6px;border-right:1px solid #e8eaf0;">'
+                f'<div style="font:700 30px Consolas,Menlo,monospace;color:{color};">{num}</div>'
+                f'<div style="font:600 11px Arial,sans-serif;letter-spacing:1px;color:#6b7390;margin-top:6px;text-transform:uppercase;">{label}</div></td>')
+
+    def section(title, color, rows, line2):
+        """rows = list of (website, name, url, extra); grouped by website."""
+        if not rows:
+            return ""
+        out = [f'<div style="padding:22px 32px 0;"><div style="font:700 16px Arial,sans-serif;color:{color};padding-bottom:8px;border-bottom:2px solid {color};">'
+               f'{e(title)} <span style="font-weight:400;color:#8a90a8;">({len(rows)})</span></div></div>']
+        shown = rows[:EMAIL_MAX_ROWS]
+        last = None
+        for site, name, url, extra in shown:
+            if site != last:
+                out.append(f'<div style="background:#f4f6fb;padding:8px 32px;font:700 11px Arial,sans-serif;letter-spacing:1px;color:#6b7390;text-transform:uppercase;">{e(site)}</div>')
+                last = site
+            out.append(f'<div style="padding:9px 32px;border-bottom:1px solid #f0f1f6;font:15px Arial,sans-serif;color:#1f2540;">'
+                       f'<a href="{e(url)}" style="color:#1f2540;text-decoration:none;font-weight:600;">{e(name)}</a>'
+                       + (f'<div style="font:12px Arial,sans-serif;color:#6b7390;margin-top:2px;">{e(extra)}</div>' if extra else "")
+                       + f'<div style="font:12px Consolas,Menlo,monospace;color:#2b4eea;margin-top:3px;word-break:break-all;">{e(url)}</div></div>')
+        if len(rows) > len(shown):
+            out.append(f'<div style="padding:10px 32px;font:13px Arial,sans-serif;color:#6b7390;">+ {len(rows) - len(shown)} more - open the spreadsheet for the full list.</div>')
+        return "".join(out)
+
+    body = []
+    body.append(section("New Launches Detected", "#15683f", launches, ""))
+    body.append(section("Courses Added", "#2b4eea", added, ""))
+    if failed:
+        body.append('<div style="margin:22px 32px 0;padding:12px 14px;background:#fff4e5;border:1px solid #f5c26b;border-radius:6px;font:13px Arial,sans-serif;color:#7a4b00;">'
+                    '<b>Sites that failed / were skipped this run (previous data kept):</b> ' + e(", ".join(failed)) + '</div>')
+    if not (launches or added or failed):
+        body.append('<div style="padding:26px 32px;font:14px Arial,sans-serif;color:#6b7390;text-align:center;">No new launches or additions this week.</div>')
+    return f"""<!DOCTYPE html><html><body style="margin:0;padding:0;background:#eef0f6;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#eef0f6;padding:24px 0;"><tr><td align="center">
+<table width="680" cellpadding="0" cellspacing="0" style="max-width:680px;width:100%;background:#ffffff;border-radius:14px;overflow:hidden;">
+<tr><td style="background:#1f35c9;background-image:linear-gradient(135deg,#1a2266,#2b4eea);padding:30px 32px;">
+  <div style="font:700 26px Arial,sans-serif;color:#ffffff;">Competitor Course Tracker - Weekly Report</div>
+  <div style="font:14px Arial,sans-serif;color:#c7d0ff;margin-top:8px;">{e(t)} &nbsp;&middot;&nbsp; {len(SITES)} sites &nbsp;&middot;&nbsp; <a href="{e(sheet_url)}" style="color:#c7d0ff;">Open spreadsheet &#8599;</a></div>
+</td></tr>
+<tr><td><table width="100%" cellpadding="0" cellspacing="0" style="border-bottom:1px solid #e8eaf0;"><tr>
+  {stat(total, "Courses tracked", "#2b4eea")}
+  {stat("+" + str(len(launches)), "New launches", "#15683f" if launches else "#9aa1b8")}
+  {stat("+" + str(len(added)), "Added", "#15683f" if added else "#9aa1b8")}
+</tr></table></td></tr>
+<tr><td>{"".join(body)}</td></tr>
+<tr><td style="background:#f7f8fc;padding:18px 32px;margin-top:24px;font:12px Arial,sans-serif;color:#9aa1b8;text-align:center;">
+  Sent automatically by the Competitor Course Tracker. {recent_total} new launch(es) from this run are on the "Recent Launches" tab. View the spreadsheet for details on all tabs.</td></tr>
+</table></td></tr></table></body></html>"""
+
+
+def send_summary_email(t, master, recent, changes, summary):
+    user, pwd = get_secret("EMAIL_USER").strip(), re.sub(r"\s+", "", get_secret("EMAIL_APP_PASSWORD"))
+    if not user or not pwd:
+        log("Email skipped (EMAIL_USER / EMAIL_APP_PASSWORD not set).")
+        return
+    try:
+        import smtplib, ssl
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+        to = [x.strip() for x in (get_secret("EMAIL_TO") or user).split(",") if x.strip()]
+        launches = [(r["Website"], r["Course Name"], r["Course URL"], f'{r["Launch Basis"]} | {r["New Course / Batch Label"]}')
+                    for r in recent if r.get("Launch Detected Date") == t]
+        added = [(c["Website"], c["Course"], c["Course URL"], "") for c in changes if c["Field Changed"] == "Course Added"]
+        failed = [s for s, v in summary.items() if v[0] != "OK"]
+        total = sum(r.get("Course Status") == "Active" for r in master)
+        sheet_url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}"
+        html_body = build_summary_html(t, total, sorted(launches), sorted(added), failed, len(recent), sheet_url)
+        text_body = (f"Competitor Course Tracker - {t}\nCourses tracked: {total} | New launches: {len(launches)} | Added: {len(added)}\n"
+                     + ("Failed sites: " + ", ".join(failed) + "\n" if failed else "") + f"Spreadsheet: {sheet_url}\n")
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = f"Course Tracker {t}: {len(launches)} new launch(es), {len(added)} added"
+        msg["From"], msg["To"] = user, ", ".join(to)
+        msg.attach(MIMEText(text_body, "plain", "utf-8"))
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+        with smtplib.SMTP_SSL(os.environ.get("SMTP_HOST", "smtp.gmail.com"), int(os.environ.get("SMTP_PORT", "465")), context=ssl.create_default_context()) as s:
+            s.login(user, pwd)
+            s.sendmail(user, to, msg.as_string())
+        log(f"Summary email sent to {', '.join(to)}")
+    except Exception as ex:                                   # an email problem must never fail the tracker run
+        log(f"Email FAILED ({type(ex).__name__}: {ex}) - tracker data is already saved")
+
+# =====================================================================
+# STORAGE + main()
+# =====================================================================
 
 TABS = ["Master", "Recent Launches", "Change Log"]
 
@@ -877,104 +1056,6 @@ class SheetsStore:
         if not with_retry(lambda: ws.get_all_values()):
             with_retry(lambda: ws.update(range_name="A1", values=[cols]))
         with_retry(lambda: ws.append_rows([[str(r.get(c, ""))[:2000] for c in cols] for r in rows], value_input_option="RAW"))
-
-
-# ---------------- EMAIL SUMMARY (sent at the end of every run) ----------------
-# Secrets (GitHub Actions secrets / environment variables):
-#   EMAIL_USER          sender address (Gmail)           e.g. you@gmail.com
-#   EMAIL_APP_PASSWORD  Gmail *App Password* (16 chars, NOT your normal password)
-#   EMAIL_TO            recipient(s), comma-separated    (defaults to EMAIL_USER)
-# If EMAIL_USER / EMAIL_APP_PASSWORD are not set, the email is simply skipped.
-EMAIL_MAX_ROWS = 40      # rows shown per section in the mail (the full data is always in the sheet)
-
-
-def build_summary_html(t, total, launches, added, removed, failed, recent_total, sheet_url):
-    from html import escape as e
-
-    def stat(num, label, color):
-        return (f'<td align="center" style="padding:18px 6px;border-right:1px solid #e8eaf0;">'
-                f'<div style="font:700 30px Consolas,Menlo,monospace;color:{color};">{num}</div>'
-                f'<div style="font:600 11px Arial,sans-serif;letter-spacing:1px;color:#6b7390;margin-top:6px;text-transform:uppercase;">{label}</div></td>')
-
-    def section(title, color, rows, line2):
-        """rows = list of (website, name, url, extra); grouped by website."""
-        if not rows:
-            return ""
-        out = [f'<div style="padding:22px 32px 0;"><div style="font:700 16px Arial,sans-serif;color:{color};padding-bottom:8px;border-bottom:2px solid {color};">'
-               f'{e(title)} <span style="font-weight:400;color:#8a90a8;">({len(rows)})</span></div></div>']
-        shown = rows[:EMAIL_MAX_ROWS]
-        last = None
-        for site, name, url, extra in shown:
-            if site != last:
-                out.append(f'<div style="background:#f4f6fb;padding:8px 32px;font:700 11px Arial,sans-serif;letter-spacing:1px;color:#6b7390;text-transform:uppercase;">{e(site)}</div>')
-                last = site
-            out.append(f'<div style="padding:9px 32px;border-bottom:1px solid #f0f1f6;font:15px Arial,sans-serif;color:#1f2540;">'
-                       f'<a href="{e(url)}" style="color:#1f2540;text-decoration:none;font-weight:600;">{e(name)}</a>'
-                       + (f'<div style="font:12px Arial,sans-serif;color:#6b7390;margin-top:2px;">{e(extra)}</div>' if extra else "")
-                       + f'<div style="font:12px Consolas,Menlo,monospace;color:#2b4eea;margin-top:3px;word-break:break-all;">{e(url)}</div></div>')
-        if len(rows) > len(shown):
-            out.append(f'<div style="padding:10px 32px;font:13px Arial,sans-serif;color:#6b7390;">+ {len(rows) - len(shown)} more - open the spreadsheet for the full list.</div>')
-        return "".join(out)
-
-    body = []
-    body.append(section("New Launches Detected", "#15683f", launches, ""))
-    body.append(section("Courses Added", "#2b4eea", added, ""))
-    body.append(section("Removed / Not Listed", "#b42318", removed, ""))
-    if failed:
-        body.append('<div style="margin:22px 32px 0;padding:12px 14px;background:#fff4e5;border:1px solid #f5c26b;border-radius:6px;font:13px Arial,sans-serif;color:#7a4b00;">'
-                    '<b>Sites that failed / were skipped this run (previous data kept):</b> ' + e(", ".join(failed)) + '</div>')
-    if not (launches or added or removed or failed):
-        body.append('<div style="padding:26px 32px;font:14px Arial,sans-serif;color:#6b7390;text-align:center;">No new launches, additions or removals this week.</div>')
-    return f"""<!DOCTYPE html><html><body style="margin:0;padding:0;background:#eef0f6;">
-<table width="100%" cellpadding="0" cellspacing="0" style="background:#eef0f6;padding:24px 0;"><tr><td align="center">
-<table width="680" cellpadding="0" cellspacing="0" style="max-width:680px;width:100%;background:#ffffff;border-radius:14px;overflow:hidden;">
-<tr><td style="background:#1f35c9;background-image:linear-gradient(135deg,#1a2266,#2b4eea);padding:30px 32px;">
-  <div style="font:700 26px Arial,sans-serif;color:#ffffff;">Competitors New Launches Tracker - Weekly Report</div>
-  <div style="font:14px Arial,sans-serif;color:#c7d0ff;margin-top:8px;">{e(t)} &nbsp;&middot;&nbsp; {len(SITES)} sites &nbsp;&middot;&nbsp; <a href="{e(sheet_url)}" style="color:#c7d0ff;">Open spreadsheet &#8599;</a></div>
-</td></tr>
-<tr><td><table width="100%" cellpadding="0" cellspacing="0" style="border-bottom:1px solid #e8eaf0;"><tr>
-  {stat(total, "Courses tracked", "#2b4eea")}
-  {stat("+" + str(len(launches)), "New launches", "#15683f" if launches else "#9aa1b8")}
-  {stat("+" + str(len(added)), "Added", "#15683f" if added else "#9aa1b8")}
-  {stat("-" + str(len(removed)), "Removed", "#b42318" if removed else "#9aa1b8")}
-</tr></table></td></tr>
-<tr><td>{"".join(body)}</td></tr>
-<tr><td style="background:#f7f8fc;padding:18px 32px;margin-top:24px;font:12px Arial,sans-serif;color:#9aa1b8;text-align:center;">
-  Sent automatically by the Competitors New Launches Tracker. {recent_total} courses are currently on the "Recent Launches" tab. View the spreadsheet for details on all tabs.</td></tr>
-</table></td></tr></table></body></html>"""
-
-
-def send_summary_email(t, master, recent, changes, summary):
-    user, pwd = get_secret("EMAIL_USER").strip(), re.sub(r"\s+", "", get_secret("EMAIL_APP_PASSWORD"))      # App Password is shown with spaces; remove them
-    if not user or not pwd:
-        log("Email skipped (EMAIL_USER / EMAIL_APP_PASSWORD not set).")
-        return
-    try:
-        import smtplib, ssl
-        from email.mime.multipart import MIMEMultipart
-        from email.mime.text import MIMEText
-        to = [x.strip() for x in (get_secret("EMAIL_TO") or user).split(",") if x.strip()]
-        launches = [(r["Website"], r["Course Name"], r["Course URL"], f'{r["Launch Basis"]} | {r["New Course / Batch Label"]}')
-                    for r in recent if r.get("Launch Detected Date") == t]
-        added = [(c["Website"], c["Course"], c["Course URL"], "") for c in changes if c["Field Changed"] == "Course Added"]
-        removed = [(c["Website"], c["Course"], c["Course URL"], "") for c in changes if c["Field Changed"] == "Course Status" and c["New Value"] == "Not Listed"]
-        failed = [s for s, v in summary.items() if v[0] != "OK"]
-        total = sum(r.get("Course Status") == "Active" for r in master)
-        sheet_url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}"
-        html_body = build_summary_html(t, total, sorted(launches), sorted(added), sorted(removed), failed, len(recent), sheet_url)
-        text_body = (f"Competitors New Launches  - {t}\nCourses tracked: {total} | New launches: {len(launches)} | Added: {len(added)} | Removed: {len(removed)}\n"
-                     + ("Failed sites: " + ", ".join(failed) + "\n" if failed else "") + f"Spreadsheet: {sheet_url}\n")
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"New Launches {t}: {len(launches)} new launch(es), {len(added)} added, {len(removed)} removed"
-        msg["From"], msg["To"] = user, ", ".join(to)
-        msg.attach(MIMEText(text_body, "plain", "utf-8"))
-        msg.attach(MIMEText(html_body, "html", "utf-8"))
-        with smtplib.SMTP_SSL(os.environ.get("SMTP_HOST", "smtp.gmail.com"), int(os.environ.get("SMTP_PORT", "465")), context=ssl.create_default_context()) as s:
-            s.login(user, pwd)
-            s.sendmail(user, to, msg.as_string())
-        log(f"Summary email sent to {', '.join(to)}")
-    except Exception as ex:                                   # an email problem must never fail the tracker run
-        log(f"Email FAILED ({type(ex).__name__}: {ex}) - tracker data is already saved")
 
 
 def main():
