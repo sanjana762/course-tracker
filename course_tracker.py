@@ -1,21 +1,142 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Competitor Course Tracker v6 + Email Summary (GitHub version).
-
-Scrapes 16 competitor edtech sites, detects new courses / batches, updates a Google Sheet
-(Master, Recent Launches, Change Log tabs) and emails an HTML summary.
-
-Configuration is read from environment variables (GitHub Actions secrets):
-  EMAIL_USER                  sender Gmail address
-  EMAIL_APP_PASSWORD          16-character Gmail App Password (NOT the normal password)
-  EMAIL_TO                    recipient(s), comma-separated (optional, defaults to EMAIL_USER)
-  FIRECRAWL_API_KEY           optional, for JavaScript-rendered pages
-  GOOGLE_SERVICE_ACCOUNT_JSON service-account key JSON (the sheet must be shared with that account)
-  SPREADSHEET_ID              optional override of the Google Sheet ID
-  STORE                       optional: "sheets" (default) or "local" (CSV files in tracker_data/)
-  ONLY_SITES                  optional: e.g. "Hero Vired,NIIT" to run a subset
-  RUN_DATE                    optional: YYYY-MM-DD to override today
 """
+Competitor Course Tracker
+-------------------------
+Scrapes course/program pages, tracks launches and changes, updates the
+configured Google Sheet or local CSV files, and sends a summary email.
+
+Configuration:
+- Set EMAIL_USER and EMAIL_APP_PASSWORD in environment variables to enable email.
+- Optionally set EMAIL_TO and FIRECRAWL_API_KEY.
+- Install dependencies from requirements.txt before running.
+"""
+
+import importlib, subprocess, sys
+for _pkg, _mod in [("beautifulsoup4", "bs4"), ("requests", "requests"), ("python-dateutil", "dateutil"), ("gspread", "gspread")]:
+    try:
+        importlib.import_module(_mod)
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "-q", "install", _pkg])
+
+import re, os, csv, json, time, gzip, hashlib
+from datetime import date, datetime
+from difflib import SequenceMatcher
+from urllib.parse import urljoin, urlparse
+from concurrent.futures import ThreadPoolExecutor
+import requests
+from bs4 import BeautifulSoup
+from dateutil import parser as dp
+
+STORE = "sheets"                       # "sheets" | "local" (CSV files in LOCAL_DIR, for testing)
+SPREADSHEET_ID = "1lYI_4cehSpkbKyL8KSncYs03YeuIw-DV3BsR9DwZvV4"
+SERVICE_ACCOUNT_FILE = ""   # empty / missing in Colab -> Colab login popup
+LOCAL_DIR = "tracker_data"
+ONLY_SITES = [s.strip() for s in os.environ.get("ONLY_SITES", "").split(",") if s.strip()]      # e.g. "Maven,Imarticus"
+RUN_DATE = os.environ.get("RUN_DATE", "")                                                       # "YYYY-MM-DD" to override today
+
+RECENT_LAUNCH_DAYS = 30          # explicit-label launch stays on "Recent Launches" this long (about 3 months)
+POTENTIAL_WINDOW_DAYS = 28       # "first appeared, no label" stays Potential this long
+STALE_START_DAYS = 30           # a batch that started longer ago than this is never a launch
+MISSING_RUNS_BEFORE_NOT_LISTED = 2
+SITE_DROP_GUARD = 0.30           # site returns < 30% of its previous course count -> scrape treated as failed
+BULK_MIN, BULK_FRAC = 6, 0.25    # more brand-new courses than max(6, 25% of old size) at once = discovery drift, not launches
+MAX_PAGES_PER_SITE = 150         # course pages opened per site per run (courses with signals first)
+MAX_SITEMAP_URLS = 600
+WORKERS = 4
+
+# ---------------- HARD EXCLUSIONS (your "links to remove" list) ----------------
+BLOCKED_HOST_RE = re.compile(r"(linkedin\.|facebook\.|twitter\.|instagram\.|youtube\.|youtu\.be|wa\.me|koyo)", re.I)     # not a source
+NOT_COURSE_PATH_RE = re.compile(                                                                                    # listing / category / tool / banner pages
+    r"(/(?:all-)?(?:courses?|programs?|programmes?|categories|category|domains?|our-programs?|free-courses?|free-online-courses?|"
+    r"online-courses?|explore|compar[\w-]*|course-compar[\w-]*|counsel[\w-]*|affiliate[\w-]*|hubs?|tags?|topics?|faculty|mentors?)/?$"
+    r"|/(?:domains?|categories|category|our-programs?|free-courses?|compar[\w-]*|affiliate[\w-]*|counsel[\w-]*|hubs?)/"
+    r"|-courses/?$|-hub/?$|ai-interviewer|interviewer|koyo|/blogs?|/articles?|/resources|/tutorials?|/interview|/login|/signup|/about|/contact|"
+    r"/terms|/privacy|/careers?|/press|/webinars?|/events?|/podcast|/news|/help|/support|/refund|/faq|/sitemap|/cart|/checkout|/community|/reviews)", re.I)
+CITY_NAMES = ["mumbai", "delhi", "new delhi", "bangalore", "bengaluru", "hyderabad", "chennai", "pune", "kolkata", "ahmedabad", "gurgaon",
+              "gurugram", "noida", "jaipur", "lucknow", "chandigarh", "indore", "kochi", "coimbatore", "nagpur", "surat", "bhopal",
+              "dubai", "singapore", "london"]
+CITY_TXT = "|".join(c.replace(" ", r"\s+") for c in CITY_NAMES)
+CITY_PAGE_RE = re.compile(r"(?:[-/_](?:in|at)[-_]|/)(?:" + "|".join(c.replace(" ", "[-_]") for c in CITY_NAMES) + r")(?:[-_/]|$)", re.I)   # ACCA/CMA/CFA city pages
+NOT_COURSE_TITLE_RE = re.compile(
+    r"^\s*(?:all|explore|browse)\s+(?:our\s+)?(?:courses?|programs?|programmes?|categories|domains?)\b|\ball\s+categories\b|"
+    r"\bcompar(?:e|ison)\s+(?:tool|courses?)\b|\bcounsel+or\b|\baffiliate\b|\binterviewer\b|\bfree\s+courses?\b|\bisb\s+hub\b|"
+    r"\bpage\s+not\s+found\b|\b404\b|\bprogram(?:me)?\s+(?:is\s+)?(?:inactive|discontinued)\b", re.I)
+JUNK_EXT = (".pdf", ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".xml", ".zip", ".mp4", ".css", ".js", ".ico")
+
+# ---------------- SITES: one dict per website ----------------
+# include/exclude = regex on the URL path | sitemap = optional | render = JS-heavy site | bare_new = a lone "New" badge is a real tag here
+# new_labels/batch_labels = this site's own wording | sections = headings above a group of cards | evergreen = names that are never "new"
+# first_appearance = may "first seen in a tracked run" count as a Possible launch? | payment_deadline = "Pay by <date>" is a payment date
+# batch_means_unclear = batch wording cannot tell new course from new batch | generic_banners = shown on EVERYTHING -> never a signal
+# deadline_recent_days = Simplilearn rule: a deadline within +/- N days of today counts as a (Possible) recent launch
+SITES = {
+    "Simplilearn": dict(start=["https://www.simplilearn.com/"], domains=["simplilearn.com"],
+        sitemap="https://www.simplilearn.com/sitemaps/sitemaps_production.xml",
+        include=r"(certification|certificate|training|course|bootcamp|program|programme|masters?|post-graduate|postgraduate|pgp|specialization|specialisation|fellowship|diploma|professional-certificate|executive|degree)",
+        exclude=r"(/ebooks?|/corporate|/authors|/career-roadmap|/refer-and-earn|/grievance|/search)",
+        new_labels=[r"new\s+launch"], weak_labels=[r"most\s+popular", r"trending"], deadline_recent_days=30),
+    "Scaler": dict(start=["https://www.scaler.com/", "https://www.scaler.com/courses/"], domains=["scaler.com"], sitemap="https://www.scaler.com/sitemap.xml",
+        include=r"(/courses?/|/academy|/data-science|/school-of-technology|/neovarsity|/devops|/program|/masters?)", exclude=r"(/hire)",
+        new_labels=[r"new\s+program(?:me)?\s+launched", r"new\s+(?:program(?:me)?|course)\s+is\s+live"],
+        batch_labels=[r"new\s+(?:beginner|advanced|weekend|weekday)\s+batch(?:es)?", r"(?:beginner|advanced)\s+batch"]),
+    "Great Learning": dict(start=["https://www.mygreatlearning.com/"], domains=["mygreatlearning.com", "greatlearning.in"],
+        include=r"(pg-|post-graduate|program|executive|masters?|mba|certificat|degree|bootcamp)", exclude=r"(/academy|/free)",
+        generic_banners=[r"applications?\s+closes?\s+today"]),
+    "Masai School": dict(start=["https://www.masaischool.com/"], domains=["masaischool.com"], render=True, bare_new=True,
+        include=r"(/programs?/|/courses?/|/bootcamp|/mba|/mit|/uai|/iit|/full-stack|/data-|/software|/masters|/pgp|/degree|/advanced)", exclude=r"(/hire|/outcomes?|/stories)",
+        batch_labels=[r"applications?\s+closes?"]),
+    "Coding Ninjas": dict(start=["https://www.codingninjas.com/courses", "https://www.codingninjas.com/"], domains=["codingninjas.com"],
+        include=r"(/courses/[^/]+|/bootcamp|/program|/data-science|/full-stack|/dsa|/placement|/certif)", exclude=r"(/studio|/library)"),
+    "Edureka": dict(start=["https://www.edureka.co/all-courses", "https://www.edureka.co/"], domains=["edureka.co"],
+        include=r"(training|certification|course|masters-program|bootcamp|post-graduate|/pgp)", exclude=r"(/cat\b)",
+        batch_labels=[r"live\s+classes?\s+started\s+on"], batch_means_unclear=True,
+        evergreen=[r"data\s+science\s+with\s+python", r"digital\s+business\s+management", r"\(20(?:1\d|2[0-5])\)"]),
+    "Newton School": dict(start=["https://www.newtonschool.co/"], domains=["newtonschool.co"],
+        include=r"(program|course|bootcamp|degree|masters|full-?stack|data|software|/ai|academy)", exclude=r"(/hire|/stories)",
+        batch_labels=[r"\d+\s+seats?\s+(?:available|left|remaining)(?:\s+in\s+this\s+batch)?"]),
+    "GrowthSchool": dict(start=["https://growthschool.io/"], domains=["growthschool.io"],
+        include=r"(workshop|masterclass|course|program|cohort|bootcamp|/ai|/learn)", exclude=r"(/stories)"),
+    "PW Skills": dict(start=["https://pwskills.com/", "https://pwskills.com/courses/"], domains=["pwskills.com"], render=True, bare_new=True,
+        include=r"(/courses?/[^/]+|bootcamp|program|/skills?)", exclude=r"(/free)"),
+    "AlmaBetter": dict(start=["https://www.almabetter.com/"], domains=["almabetter.com"], bare_new=True,       # "New" tag = course ; "New Batch Starting <date>" = batch
+        include=r"(program|course|bootcamp|full-stack|data-science|masters|pgp|cloud|devops|cyber|specialisation|specialization|certificat)", exclude=r"(/bytes|/stories|/hire)"),
+    "Intellipaat": dict(start=["https://intellipaat.com/"], domains=["intellipaat.com"], first_appearance=False,   # no tags/deadlines on the site -> only an explicit label could flag it
+        include=r"(training|certification|course|masters|program|bootcamp|post-graduate|/pgp)", exclude=r"(/interview-questions|/cheat-sheet|/academy)"),
+    "Imarticus": dict(start=["https://imarticus.org/"], domains=["imarticus.org"],
+        include=r"(program|course|certification|/pgp|/pg-|executive|masters|bootcamp|/cfa|/cma|/acca|/frm)", exclude=r"(/placements?|/testimonials?)",
+        evergreen=[r"\b(?:cfa|cma|acca|cpa|cibop|frm)\b", r"financial\s+analysis", r"banking\s*(?:and|&)\s*finance"]),
+}
+
+# ---------------- generic vocabulary (sites ADD to it) ----------------
+BATCH_RX = [r"new\s+(?:batch(?:es)?|cohorts?|intake)", r"next\s+(?:batch|cohort)(?:\s+starts?)?", r"upcoming\s+(?:batch(?:es)?|cohorts?)",
+            r"cohorts?\s+start(?:s|ing)", r"batch\s+start(?:s|ing)", r"admissions?\s+open", r"applications?\s+open", r"starting\s+soon",
+            r"live\s+classes?\s+start(?:s|ed|ing)", r"\d+\s+seats?\s+(?:available|left|remaining)", r"limited\s+seats?", r"pay\s+by"]
+NEW_RX = [r"new\s*launch(?:ed|es)?", r"newly\s+launched", r"just\s+launched", r"recently\s+launched", r"new\s+program(?:me)?\s+launched",
+          r"new\s+(?:course|program(?:me)?|certification|offering)s?\b(?!\s+batch)", r"newly\s+(?:added|introduced)"]
+GENERIC_WEAK = [r"most\s+popular", r"trending(?:\s+now)?", r"featured", r"upcoming"]
+NEW_SECTION_RE = re.compile(r"\b(new\s+(?:launches?|courses?|programs?|programmes?|arrivals|offerings?)|just\s+launched|newly\s+launched|recently\s+launched|latest\s+(?:launches|courses|programs))\b", re.I)
+SECTION_STOP_RE = re.compile(r"(all\s+courses|explore|browse|popular|trending|categories|top\s|featured|upcoming|starting\s+soon|new\s+on|testimonials|why\s|faq)", re.I)
+
+MON = r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+DATE_RE = rf"(?:\d{{1,2}}(?:st|nd|rd|th)?[\s\-]+{MON}\.?(?:,?\s*\d{{4}})?|{MON}\.?\s+\d{{1,2}}(?:st|nd|rd|th)?(?:,?\s*\d{{4}})?)"
+KEY_RE = (r"(?:apply\s+(?:by|before)|applications?\s+(?:close|closes|closing|end|ends)(?:\s+on)?|last\s+date(?:\s+to\s+apply)?|deadline|register\s+(?:by|before)"
+          r"|registrations?\s+(?:close|closes|closing)(?:\s+on)?|enrol(?:l)?(?:ment)?\s+(?:closes|ends|by|before)|closes?\s+on|closing\s+on|pay\s+(?:by|before)"
+          r"|admissions?\s+(?:close|closes|closing|end|ends)(?:\s+on)?)")
+DEADLINE_RE = re.compile(rf"(?P<key>{KEY_RE})\s*[:\-–]?\s*(?P<date>{DATE_RE})", re.I)
+START_RE = re.compile(rf"(?:start(?:s|ed|ing)?|commenc(?:es|ed|ing)|begin(?:s|ning)?)(?:\s+date)?\s*(?:on|from)?\s*[:\-–]?\s*({DATE_RE})", re.I)
+DURATION_RE = re.compile(r"\d+(?:\.\d+)?\s*(?:months?|weeks?|hours?|days?|years?)", re.I)
+HEADING_RE = re.compile(r"^h[1-6]$")
+IGNORE_RE = re.compile(r"(navbar|nav-|-nav\b|mega|menu|footer|breadcrumb|related|recommend|similar|you-may|also-like|cookie|popup|modal)", re.I)
+UA = {"User-Agent": "Mozilla/5.0 (compatible; CourseTracker/5.0)", "Accept-Language": "en-IN,en;q=0.9"}
+MISSING = "Not mentioned"
+
+
+def log(*a):
+    print(*a, flush=True)
+
+
+def squash(s):
+    return re.sub(r"\s+", " ", (s or "").replace("\u00a0", " ")).strip()
 
 import importlib, subprocess, sys
 for _pkg, _mod in [("beautifulsoup4", "bs4"), ("requests", "requests"), ("python-dateutil", "dateutil"), ("gspread", "gspread")]:
@@ -33,8 +154,8 @@ import requests
 from bs4 import BeautifulSoup
 from dateutil import parser as dp
 
-STORE = os.environ.get("STORE", "sheets")                       # "sheets" | "local" (CSV files in LOCAL_DIR, for testing)
-SPREADSHEET_ID ="1dxiaucMh5MHfMMfWEYSJ9_SpmKOFgJM9"
+STORE = "sheets"                       # "sheets" | "local" (CSV files in LOCAL_DIR, for testing)
+SPREADSHEET_ID = "1lYI_4cehSpkbKyL8KSncYs03YeuIw-DV3BsR9DwZvV4"
 SERVICE_ACCOUNT_FILE = ""   # empty / missing in Colab -> Colab login popup
 LOCAL_DIR = "tracker_data"
 ONLY_SITES = [s.strip() for s in os.environ.get("ONLY_SITES", "").split(",") if s.strip()]      # e.g. "Hero Vired,NIIT"
@@ -864,9 +985,7 @@ def recent_launches(master, today):
            if r.get("Course Status") == "Active" and r.get("Launch Basis") and r.get("Launch Detected Date") == t]
     return sorted(out, key=lambda r: (r["Launch Detected Date"], r["Website"]), reverse=True)
 
-# =====================================================================
-# EMAIL SUMMARY
-# =====================================================================
+"""## Email summary"""
 
 # ---------------- EMAIL SUMMARY (sent at the end of every run) ----------------
 # Secrets (GitHub Actions secrets / environment variables):
@@ -962,9 +1081,7 @@ def send_summary_email(t, master, recent, changes, summary):
     except Exception as ex:                                   # an email problem must never fail the tracker run
         log(f"Email FAILED ({type(ex).__name__}: {ex}) - tracker data is already saved")
 
-# =====================================================================
-# STORAGE + main()
-# =====================================================================
+"""## Storage + main()"""
 
 TABS = ["Master", "Recent Launches", "Change Log"]
 
@@ -1103,6 +1220,10 @@ def main():
     send_summary_email(t, master, recent, changes, summary)
     return master, recent
 
+"""## Step 2 - full run (scrape -> sheet -> email)"""
 
-if __name__ == "__main__":
-    main()
+# FULL RUN: scrapes the sites, updates the Google Sheet, then emails the summary.
+# NOTE: STORE = "sheets" writes to your real Google Sheet (Colab will ask you to log in). Use STORE = "local" in the config cell to test without touching the sheet.
+# To test quickly with fewer sites, uncomment:  os.environ["ONLY_SITES"] = "Hero Vired,NIIT"  (then re-run the config cell)
+master, recent = main()
+
