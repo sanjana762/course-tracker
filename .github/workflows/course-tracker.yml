@@ -1,9 +1,6 @@
 name: Weekly Course Tracker
 
 on:
-  schedule:
-    # GitHub cron is always UTC. 04:30 UTC = 10:00 AM IST, every Monday.
-    - cron: "30 4 * * 1"
   workflow_dispatch:
 
 jobs:
