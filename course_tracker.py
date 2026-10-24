@@ -28,7 +28,7 @@ from bs4 import BeautifulSoup
 from dateutil import parser as dp
 
 STORE = "sheets"                       # "sheets" | "local" (CSV files in LOCAL_DIR, for testing)
-SPREADSHEET_ID = "1dxiaucMh5MHfMMfWEYSJ9_SpmKOFgJM9"
+SPREADSHEET_ID = "1lYI_4cehSpkbKyL8KSncYs03YeuIw-DV3BsR9DwZvV4"
 SERVICE_ACCOUNT_FILE = ""   # empty / missing in Colab -> Colab login popup
 LOCAL_DIR = "tracker_data"
 ONLY_SITES = [s.strip() for s in os.environ.get("ONLY_SITES", "").split(",") if s.strip()]      # e.g. "Maven,Imarticus"
