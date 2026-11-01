@@ -2,3 +2,4 @@ __pycache__/
 tracker_data/
 *.json
 .env
+venv/
